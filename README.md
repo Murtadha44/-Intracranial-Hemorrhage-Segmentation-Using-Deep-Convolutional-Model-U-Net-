@@ -4,8 +4,7 @@ A dataset of 82 CT scans of patients with traumatic brain injury was collected a
 
 This code consists of main.py that performs 5-fold cross-validation to train and evaluate U-Net. Prepare_data.py is to 1-download the ICH segmentation dataset and unzip it to ich_data. 2-load all CT scans to divide them for training, validation and testing folders
                    DataV1\CV0\train
-                             \validate
-                             \test
-                   DataV1\CV1\...
+                         ,...\validate
+                         ,...\test
 3-Divide each slice into 49 crops using 160x160 window with stride 80. model.py contains the U-Net model, and data_process.py has all the functions required to generate training and testing data to train and test the model, and also to save the generated masks.
 To run this code, create a Python environment that contains the following libraries (numpy, os, pickle, cv2, glob, skimage, keras, tensorflow, sklearn, scipy, pathlib, pandas, urllib, zipfile), then run main.py.
