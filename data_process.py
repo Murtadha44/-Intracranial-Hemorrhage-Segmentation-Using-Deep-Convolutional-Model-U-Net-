@@ -1,9 +1,8 @@
 from __future__ import print_function
 from keras.preprocessing.image import ImageDataGenerator
 import numpy as np,os,glob
-import skimage.io as io
 import skimage.transform as trans
-from scipy.misc import imsave
+from imageio import imsave, imread
 from pathlib import Path
 
 #This code was original downloaded from https://github.com/zhixuhao/unet, then edited
@@ -32,7 +31,7 @@ def adjustData(img,mask,flag_multi_class,num_class):
 
 def trainGenerator(batch_size,train_path,image_folder,mask_folder,aug_dict,image_color_mode = "grayscale",
                     mask_color_mode = "grayscale",image_save_prefix  = "image",mask_save_prefix  = "mask",
-                    flag_multi_class = False,num_class = 2,save_to_dir = None,target_size = (160,160),seed = 1):
+                    flag_multi_class = False,num_class = 2,save_to_dir = None,target_size = (128,128),seed = 1):
     '''
     can generate image and mask at the same time
     use the same seed for image_datagen and mask_datagen to ensure the transformation for image and mask is the same
@@ -67,7 +66,7 @@ def trainGenerator(batch_size,train_path,image_folder,mask_folder,aug_dict,image
 
 def validateGenerator(batch_size,train_path,image_folder,mask_folder,image_color_mode = "grayscale",
                     mask_color_mode = "grayscale",image_save_prefix  = "image",mask_save_prefix  = "mask",
-                    flag_multi_class = False,num_class = 2,save_to_dir = None,target_size = (160,160),seed = 1):
+                    flag_multi_class = False,num_class = 2,save_to_dir = None,target_size = (128,128),seed = 1):
     '''
     can generate image and mask at the same time
     use the same seed for image_datagen and mask_datagen to ensure the transformation for image and mask is the same
@@ -101,10 +100,10 @@ def validateGenerator(batch_size,train_path,image_folder,mask_folder,image_color
         yield (img,mask)
 
 
-def testGenerator(test_path,target_size = (160,160),flag_multi_class = False,as_gray = True):
+def testGenerator(test_path, target_size = (128,128),flag_multi_class = False,as_gray = True):
     image_name_arr = glob.glob(os.path.join(test_path, "*.png"))
     for index, item in enumerate(image_name_arr):
-        img = io.imread(item, as_gray=as_gray)
+        img = imread(item)
         img = img / 255
         if img.shape[0]!=target_size[0]|img.shape[1]!=target_size[1]:
             img = trans.resize(img, target_size)
@@ -118,9 +117,9 @@ def geneTrainNpy(image_path,mask_path,flag_multi_class = False,num_class = 2,ima
     image_arr = []
     mask_arr = []
     for index,item in enumerate(image_name_arr):
-        img = io.imread(item,as_gray = image_as_gray)
+        img = imread(item)
         img = np.reshape(img,img.shape + (1,)) if image_as_gray else img
-        mask = io.imread(item.replace(image_path,mask_path).replace(image_prefix,mask_prefix),as_gray = mask_as_gray)
+        mask = imread(item.replace(image_path,mask_path).replace(image_prefix,mask_prefix))
         mask = np.reshape(mask,mask.shape + (1,)) if mask_as_gray else mask
         img,mask = adjustData(img,mask,flag_multi_class,num_class)
         image_arr.append(img)
@@ -136,15 +135,14 @@ def saveResult(test_path,save_path,npyfile,flag_multi_class = False,num_class = 
     index = string.find(word)+6
     for i,item in enumerate(image_name_arr):
         img = npyfile[i,:,:,0]
-        imsave(Path(save_path, item[index:]), img) #29: to take only the image name that was read before
-        #The image loaded using io.imread has a range between [0, 255*255] when it is saved using io.imsave
+        imsave(Path(save_path, item[index:]), np.uint8(img*255)) #index: to take only the image name that was read before
 
-def LoadTestMask(test_path,num_image,target_size = (160,160),flag_multi_class = False,as_gray = True):
-    Allsegment = np.zeros([num_image, 160, 160, 1], dtype=np.float32)
+def LoadTestMask(test_path,num_image,target_size = (128,128),flag_multi_class = False,as_gray = True):
+    Allsegment = np.zeros([num_image, target_size[0], target_size[1], 1], dtype=np.float32)
     counterI=0
     image_name_arr = glob.glob(os.path.join(test_path, "*.png"))
     for index, item in enumerate(image_name_arr):
-        mask = io.imread(item, as_gray=as_gray)
+        mask = imread(item)
         mask = mask / 255
         mask[mask > 0.5] = 1
         mask[mask <= 0.5] = 0

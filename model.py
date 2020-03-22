@@ -10,7 +10,7 @@ def jaccard_loss(y_true, y_pred): #https://www.jeremyjordan.me/evaluating-image-
     union = 1 -((1-y_true)*(1-y_pred))
     return 1-(K.sum(intersection) / K.sum(union))
 
-def unet(pretrained_weights = None,input_size = (160,160,1),learningRate=1e-5,decayRate=1e-7):
+def unet(pretrained_weights = None,input_size = (128,128,1),learningRate=1e-5,decayRate=1e-7):
     ModInputs = Input(input_size)
     conv1 = Conv2D(64, 3, activation = 'relu', padding = 'same', kernel_initializer = 'he_normal')(ModInputs)
     conv1 = Conv2D(64, 3, activation = 'relu', padding = 'same', kernel_initializer = 'he_normal')(conv1)

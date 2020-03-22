@@ -1,313 +1,222 @@
 import numpy as np, os, random
 from pathlib import Path
 import pandas as pd
-from scipy.misc import imread, imsave
+from imageio import imsave
 import pickle
-import urllib.request
 import zipfile
+import nibabel as nib
 
-def prepare_data(crossvalid_dir='DataV1'):
-    #This function is to 1-download the ICH segmentation dataset and unzip it to ich_data.
-    #                2-load all CT scans to divide them for training, validation and testing folders
+def window_ct (ct_scan, w_level=40, w_width=120):
+    w_min = w_level - w_width / 2
+    w_max = w_level + w_width / 2
+    num_slices=ct_scan.shape[2]
+    for s in range(num_slices):
+        slice_s = ct_scan[:,:,s]
+        slice_s = (slice_s - w_min)*(255/(w_max-w_min)) #or slice_s = (slice_s - (w_level-(w_width/2)))*(255/(w_width))
+        slice_s[slice_s < 0]=0
+        slice_s[slice_s > 255] = 255
+        #slice_s=np.rot90(slice_s)
+        ct_scan[:,:,s] = slice_s
+
+    return ct_scan
+
+def load_ct_mask(datasetDir,sub_n, window_specs):
+    ct_dir_subj = Path(datasetDir, 'ct_scans', "{0:0=3d}.nii".format(sub_n))
+    ct_scan_nifti = nib.load(str(ct_dir_subj))
+    ct_scan = ct_scan_nifti.get_data()
+    ct_scan = window_ct(ct_scan, window_specs[0], window_specs[1])  # Convert the CT scans using a brain window
+    # Loading the masks
+    masks_dir_subj = Path(datasetDir, 'masks', "{0:0=3d}.nii".format(sub_n))
+    masks_nifti = nib.load(str(masks_dir_subj))
+    masks = masks_nifti.get_data()
+    return ct_scan, masks
+
+def segment_ct(x, imageLen, windowLen, n_moves):
+    x_segmented = np.zeros([windowLen, windowLen, n_moves * n_moves], dtype=np.uint8)
+    counterCrop = 0
+    for i in range(n_moves):
+        for j in range(n_moves):
+            x_segmented[:, :, counterCrop] = x[int(i * imageLen / (n_moves + 1)):int(
+                i * imageLen / (n_moves + 1) + windowLen),
+                                            int(j * imageLen / (n_moves + 1)):int(
+                                                j * imageLen / (n_moves + 1) + windowLen)]
+            counterCrop = counterCrop + 1
+    return x_segmented
+
+def prepare_data(dataset_zip_dir, crossvalid_dir, numSubj, imageLen, windowLen, strideLen, n_moves, window_specs):
+    #This function is to 1-load the ICH segmentation dataset and unzip it to ich_data.
+    #                2-load all CT scans (nifti format) to divide them for training, validation and testing folders
     #                   DataV1\CV0\train
     #                             \validate
     #                             \test
     #                   DataV1\CV1\...
-    #                3-Divide each slice into 49 crops using 160x160 window with stride 80.
+    #                3-Divide each slice into 49 crops using 128x128 window with stride 64.
+    #                4-For the training and validation data, saving only the crops that have ICH, whereas for the testing
+    #                  data, saving all the crops.
     #
 
 
     currentDir=Path(os.getcwd())
-    datasetDir=str(Path(currentDir,'ich_data',
-                        'computed-tomography-images-for-intracranial-hemorrhage-detection-and-segmentation-1.0.0'))
+    datasetDir=Path(currentDir, 'ich_data', dataset_zip_dir[:-4])
     if os.path.isfile(str(Path(crossvalid_dir,'ICH_DataSegmentV1.pkl')))==False: #means the cross-validation folds was created before
-        if os.path.isdir(str(Path(crossvalid_dir))) == False:
-            os.mkdir(str(Path(crossvalid_dir)))
+        if os.path.isdir(crossvalid_dir) == False:
+            os.mkdir(crossvalid_dir)
 
-        #Download the dataset
-        url = 'https://physionet.org/static/published-projects/ct-ich/computed-tomography-images-for-intracranial-hemorrhage-detection-and-segmentation-1.0.0.zip'
-        if os.path.isdir(str(Path('ich_data'))) == False:
-            if os.path.exists(str(Path('ich_data.zip')))==False:
-                print("Loading the ICH segmentation dataset from physionet.org")
-                urllib.request.urlretrieve(url, "ich_data.zip")
+        #Load the dataset
+        if os.path.exists(dataset_zip_dir)==True:
+            if os.path.exists(str(datasetDir))==True:
+                print("The dataset is already unzipped!")
             else:
                 print("Unzipping dataset, this may take a while!")
-                with zipfile.ZipFile('ich_data.zip', 'r') as zip_ref:
+                with zipfile.ZipFile(dataset_zip_dir, 'r') as zip_ref:
                     zip_ref.extractall('ich_data')
 
-        numSubj=82
-        imageLen = 640
-        windowLen=160
-        strideLen=80
-        noMoves = int(imageLen/strideLen)-1
+            #Reading labels
+            hemorrhage_diagnosis_df = pd.read_csv(Path(datasetDir, 'hemorrhage_diagnosis_raw_ct.csv'))
+            hemorrhage_diagnosis_array = hemorrhage_diagnosis_df._get_values
+            '''columns=['PatientNumber','SliceNumber','Intraventricular','Intraparenchymal','Subarachnoid','Epidural',
+                                                                                      'Subdural', 'No_Hemorrhage']) '''
+            hemorrhage_diagnosis_array[:, 0] = hemorrhage_diagnosis_array[:, 0] - 49  # starting the subject count from 0
 
-        #Training, Validation and testing using 5-fold Crossvalidation
-        NoCV=5# number of crossvalidation folds
-        sNos=[31, 39, 21, 33, 34, 5,54,2,67,15,68,10,53,29,44,76,59,73,77,71,61,69,50,32,6,37,57,75,
-              80,41,27,16,40,46,79,13,45,55,62,7,66,58,78,4,47,52,28,20,24,51,36,63,30,48,26,60,49,
-              25,42,18,43,14,72,0,35,81,70,22,64,1,3,17,74,23,38,12,8,65,19,56,9,11] #already shuffled
+            #Training, Validation and testing using 5-fold Crossvalidation
+            NumCV=5# number of crossvalidation folds
+            subject_nums = np.unique(hemorrhage_diagnosis_array[:, 0])
+            subject_nums_shaffled = [31, 39, 21, 33, 34, 5, 54, 2, 67, 68, 53, 29, 44, 76, 59, 73, 77, 71, 61, 69, 50, 32, 6, 37,
+                    57, 75, 80, 41, 27, 40, 46, 79, 45, 55, 62, 7, 66, 58, 78, 4, 47, 52, 28, 20, 24, 51, 36, 63, 30,
+                    48, 26, 60, 49, 25, 42, 18, 43, 72, 0, 35, 81, 70, 22, 64, 1, 3, 17, 74, 23, 38, 8, 65, 19,
+                    56, 9]  # already shuffled #subject# 10 to 16 are missing
 
+            #reading images
+            print("Dividing the data for the 5-fold cross-validation:")
+            for cvI in range(0,NumCV):
+                print("Working on fold #"+str(cvI))
+                print("The full CT slices and the crops will be save to:" + str(Path(crossvalid_dir, 'CV' + str(cvI))))
+                if os.path.isdir(str(Path(crossvalid_dir,'CV'+str(cvI)))) == False:
+                    os.mkdir(str(Path(crossvalid_dir,'CV'+str(cvI))))
+                    os.mkdir(str(Path(crossvalid_dir,'CV'+str(cvI),'train')))
+                    os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'train', 'image')))
+                    os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'train','label')))
+                    os.mkdir(str(Path(crossvalid_dir,'CV' + str(cvI), 'test')))
+                    os.mkdir(str(Path(crossvalid_dir,'CV' + str(cvI), 'test','fullCT')))
+                    os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'test', 'crops')))
+                    os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'test','fullCT', 'image')))
+                    os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'test','fullCT','label')))
+                    os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'test', 'crops', 'image')))
+                    os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'test', 'crops','label')))
+                    os.mkdir(str(Path(crossvalid_dir,'CV' + str(cvI), 'validate')))
+                    os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'validate', 'image')))
+                    os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'validate','label')))
 
-        #Reading labels
-        hemorrhage_diagnosis_df = pd.read_csv(Path(datasetDir, 'hemorrhage_diagnosis.csv'))
-        hemorrhage_diagnosis_array = hemorrhage_diagnosis_df._get_values
-        '''columns=['PatientNumber','SliceNumber','Intraventricular','Intraparenchymal','Subarachnoid','Epidural',
-                                                                                  'Subdural', 'No_Hemorrhage']) '''
-        hemorrhage_diagnosis_array[:, 0] = hemorrhage_diagnosis_array[:, 0] - 49  # starting the subject count from 0
+                if cvI<NumCV-1:
+                    subjectNums_cvI_testing = subject_nums_shaffled[cvI*int(numSubj/NumCV):cvI*int(numSubj/NumCV)+int(numSubj/NumCV)]
+                    subjectNums_cvI_trainVal = np.delete(subject_nums_shaffled,range(cvI * int(numSubj / NumCV),cvI * int(numSubj / NumCV) + int(numSubj / NumCV)))
+                else:
+                    subjectNums_cvI_testing = subject_nums_shaffled[cvI*int(numSubj/NumCV):numSubj]
+                    subjectNums_cvI_trainVal = np.delete(subject_nums_shaffled,range(cvI * int(numSubj / NumCV),numSubj))
 
-        #reading images
-        print("Dividing the data for the 5-fold cross-validation:")
-        for cvI in range(0,NoCV):
-            print("Working on fold #"+str(cvI))
-            print("The full CT slices and the crops will be save to:" + str(Path(crossvalid_dir, 'CV' + str(cvI))))
-            if os.path.isdir(str(Path(crossvalid_dir,'CV'+str(cvI)))) == False:
-                os.mkdir(str(Path(crossvalid_dir,'CV'+str(cvI))))
-                os.mkdir(str(Path(crossvalid_dir,'CV'+str(cvI),'train')))
-                os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'train', 'image')))
-                os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'train','label')))
-                os.mkdir(str(Path(crossvalid_dir,'CV' + str(cvI), 'test')))
-                os.mkdir(str(Path(crossvalid_dir,'CV' + str(cvI), 'test','fullCT')))
-                os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'test', 'crops')))
-                os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'test','fullCT', 'image')))
-                os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'test','fullCT','label')))
-                os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'test', 'crops', 'image')))
-                os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'test', 'crops','label')))
-                os.mkdir(str(Path(crossvalid_dir,'CV' + str(cvI), 'validate')))
-                os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'validate', 'image')))
-                os.mkdir(str(Path(crossvalid_dir, 'CV' + str(cvI), 'validate','label')))
+                counterI=0
 
-            if cvI<NoCV-1:
-                subjectNos_cvI_testing=sNos[cvI*int(numSubj/NoCV):cvI*int(numSubj/NoCV)+int(numSubj/NoCV)]
-                subjectNos_cvI_trainVal = np.delete(sNos,range(cvI * int(numSubj / NoCV),cvI * int(numSubj / NoCV) + int(numSubj / NoCV)))
-            else:
-                subjectNos_cvI_testing = sNos[cvI*int(numSubj/NoCV):numSubj]
-                subjectNos_cvI_trainVal = np.delete(sNos,range(cvI * int(numSubj / NoCV),numSubj))
+                #Training CT scans
+                for subItrain in range(int(numSubj / NumCV),len(subjectNums_cvI_trainVal)):  # take only the 3 folds for training
+                    sliceNums=hemorrhage_diagnosis_array[hemorrhage_diagnosis_array[:,0]==subjectNums_cvI_trainVal[subItrain],1]
 
-            counterI=0
-            #Training CT scans
-            for subItrain in range(int(numSubj / NoCV),len(subjectNos_cvI_trainVal)):  # take only the 3 folds for training
-                sliceNos=hemorrhage_diagnosis_array[hemorrhage_diagnosis_array[:,0]==subjectNos_cvI_trainVal[subItrain],1]
-                datasetDirSubj = Path(datasetDir,
-                        'Patients_CT', "{0:0=3d}".format(subjectNos_cvI_trainVal[subItrain]+49))
-                NoHemorrhage=hemorrhage_diagnosis_array[hemorrhage_diagnosis_array[:, 0] == subjectNos_cvI_trainVal[subItrain], 7]
-                SlicesWithoutHemm = np.nonzero(NoHemorrhage)
-                randomSlice=random.choice(SlicesWithoutHemm[0])
-                for sliceI in range(0,sliceNos.size):
-                    x_original=np.zeros([windowLen,windowLen,noMoves*noMoves],dtype=np.uint8)
-                    x_segment = np.zeros([windowLen, windowLen, noMoves*noMoves],dtype=np.uint8)
-                    if NoHemorrhage[sliceI] == 0: #Saving only the windows that have hemorrhage
-                        img_path=Path(datasetDirSubj,'brain',str(sliceNos[sliceI]) + '.jpg')
-                        img = imread(img_path)
-                        ##img = imresize(img,new_size)
-                        x = img[5:-5, 5:-5]  # clipping the image to size 640 (new_size)
-                        counterCrop=0
-                        for i in range(noMoves):
-                            for j in range(noMoves):
-                                x_original[:, :, counterCrop] = x[int(i*imageLen/(noMoves+1)):int(i*imageLen/(noMoves+1)+windowLen),
-                                                                int(j*imageLen/(noMoves+1)):int(j*imageLen/(noMoves+1)+windowLen)]
-                                counterCrop=counterCrop+1
+                    # Loading the CT scans and the masks
+                    ct_scan, masks= load_ct_mask(datasetDir, subjectNums_cvI_trainVal[subItrain]+49, window_specs)
 
-                        #Reading the segmentation for a given slice
-                        segment_path = Path(datasetDirSubj,'brain',str(sliceNos[sliceI])+ '_HGE_Seg.jpg')
-                        if os.path.exists(str(segment_path)):
-                            img = imread(segment_path)
-                            ##img = imresize(img,new_size)
-                            x = np.where(img > 128, 255,
-                                         0)  # Because of the resize the image has some values that are not 0 or 255, so make them 0 or 255
-                            x = x[5:-5, 5:-5]  # clipping the image to size 640 (new_size)
-                            counterCrop = 0
-                            for i in range(noMoves):
-                                for j in range(noMoves):
-                                    x_segment[:, :, counterCrop] =  x[int(i*imageLen/(noMoves+1)):int(i*imageLen/(noMoves+1)+windowLen),
-                                                                int(j*imageLen/(noMoves+1)):int(j*imageLen/(noMoves+1)+windowLen)]
-                                    counterCrop = counterCrop + 1
+                    NoHemorrhage=hemorrhage_diagnosis_array[hemorrhage_diagnosis_array[:, 0] == subjectNums_cvI_trainVal[subItrain], 7]
+                    SlicesWithoutHemm = np.nonzero(NoHemorrhage)
+                    randomSlice=random.choice(SlicesWithoutHemm[0])
+                    for sliceI in range(0,sliceNums.size):
+                        if NoHemorrhage[sliceI] == 0 or sliceI==randomSlice: # Saving only the windows that have hemorrhage or
+                                                                             # if the slice is selected randomly then save its crops
+                            #segmenting the ct scan and the masks
+                            x_ct_segmented = segment_ct(ct_scan[:, :, sliceI], imageLen, windowLen, n_moves)
+                            x_mask_segment = segment_ct(masks[:, :, sliceI], imageLen, windowLen, n_moves)
 
                             #Saving only the windows that have hemorrhage
-                            for i in range(noMoves*noMoves):
-                                if sum(sum(x_segment[:, :, i]))>0:
-                                    x_original[-1, -1, i] = 255  # having a pixel of 255 so the array will not rescaled to 0-255 bym imsave
-                                    imsave(Path(crossvalid_dir,'CV' +str(cvI),'train','image',str(counterI) + '.png'), x_original[:,:,i])
-                                    imsave(Path(crossvalid_dir,'CV' +str(cvI),'train','label',str(counterI) + '.png'), x_segment[:, :,i])
+                            for i in range(n_moves*n_moves):
+                                if sum(sum(x_mask_segment[:, :, i]))>0:
+                                    imsave(Path(crossvalid_dir,'CV' +str(cvI),'train','image',str(counterI) + '.png'), np.uint8(x_ct_segmented[:,:,i]))
+                                    imsave(Path(crossvalid_dir,'CV' +str(cvI),'train','label',str(counterI) + '.png'), np.uint8(x_mask_segment[:, :,i]))
                                     counterI = counterI + 1
-                        else:
-                            print("Error: Segmentation image was not found.")
-                    elif sliceI==randomSlice: #if the slice is selected randomly then save its crops
-                        img_path=Path(datasetDirSubj,'brain',str(sliceNos[sliceI]) + '.jpg')
-                        img = imread(img_path)
-                        ##img = imresize(img,new_size)
-                        x = img[5:-5, 5:-5]  # clipping the image to size 640 (new_size)
-                        counterCrop=0
-                        for i in range(noMoves):
-                            for j in range(noMoves):
-                                x_original[:, :, counterCrop] = x[int(i*imageLen/(noMoves+1)):int(i*imageLen/(noMoves+1)+windowLen),
-                                                                int(j*imageLen/(noMoves+1)):int(j*imageLen/(noMoves+1)+windowLen)]
-                                counterCrop=counterCrop+1
 
-                        #Reading the segmentation for a given slice
-                        x = np.zeros((640, 640),dtype=np.uint8) # No hemorrhage for detected in this slice so all zeros
-                        counterCrop = 0
-                        for i in range(noMoves):
-                            for j in range(noMoves):
-                                x_segment[:, :, counterCrop] =  x[int(i*imageLen/(noMoves+1)):int(i*imageLen/(noMoves+1)+windowLen),
-                                                            int(j*imageLen/(noMoves+1)):int(j*imageLen/(noMoves+1)+windowLen)]
-                                counterCrop = counterCrop + 1
 
-                        #Saving only the windows that have hemorrhage
-                        for i in range(noMoves*noMoves):
-                            x_original[-1, -1, i] = 255  # having a pixel of 255 so the array will not rescaled to 0-255 bym imsave
-                            imsave(Path(crossvalid_dir,'CV' +str(cvI),'train','image',str(counterI) + '.png'), x_original[:,:,i])
-                            imsave(Path(crossvalid_dir,'CV' +str(cvI),'train','label',str(counterI) + '.png'), x_segment[:, :,i])
-                            counterI = counterI + 1
-
-            # Validation CT scans
-            counterI = 0
-            for subIvalidate in range(0, int(numSubj / NoCV)):  # take only the first fold for validation
-                sliceNos = hemorrhage_diagnosis_array[hemorrhage_diagnosis_array[:, 0] == subjectNos_cvI_trainVal[subIvalidate], 1]
-                datasetDirSubj = Path(datasetDir,
-                        'Patients_CT', "{0:0=3d}".format(subjectNos_cvI_trainVal[subIvalidate]+49))
-                NoHemorrhage = hemorrhage_diagnosis_array[hemorrhage_diagnosis_array[:, 0] == subjectNos_cvI_trainVal[subIvalidate], 7]
-
-                for sliceI in range(0,sliceNos.size):
-                    x_original=np.zeros([windowLen,windowLen,noMoves*noMoves],dtype=np.uint8)
-                    x_segment = np.zeros([windowLen, windowLen, noMoves*noMoves],dtype=np.uint8)
-                    if NoHemorrhage[sliceI] == 0:  # Saving only the windows that have hemorrhage. Thus it will be used to select the model with highest detection
-                        img_path = Path(datasetDirSubj,'brain', str(sliceNos[sliceI]) + '.jpg')
-                        img = imread(img_path)
-                        ##img = imresize(img,new_size)
-                        x = img[5:-5, 5:-5]  # clipping the image to size 640 (new_size)
-                        counterCrop = 0
-                        for i in range(noMoves):
-                            for j in range(noMoves):
-                                x_original[:, :, counterCrop] = x[int(i * imageLen / (noMoves + 1)):int(
-                                    i * imageLen / (noMoves + 1) + windowLen),
-                                                                int(j * imageLen / (noMoves + 1)):int(
-                                                                    j * imageLen / (noMoves + 1) + windowLen)]
-                                counterCrop = counterCrop + 1
-
-                        # Reading the segmentation for a given slice
-                        segment_path = Path(datasetDirSubj,'brain', str(sliceNos[sliceI]) + '_HGE_Seg.jpg')
-                        if os.path.exists(str(segment_path)):
-                            img = imread(segment_path)
-                            ##img = imresize(img,new_size)
-                            x = np.where(img > 128, 255,
-                                         0)  # Because of the resize the image has some values that are not 0 or 255, so make them 0 or 255
-                            x = x[5:-5, 5:-5]  # clipping the image to size 640 (new_size)
-                            counterCrop = 0
-                            for i in range(noMoves):
-                                for j in range(noMoves):
-                                    x_segment[:, :, counterCrop] = x[int(i * imageLen / (noMoves + 1)):int(
-                                        i * imageLen / (noMoves + 1) + windowLen),
-                                                                   int(j * imageLen / (noMoves + 1)):int(
-                                                                       j * imageLen / (noMoves + 1) + windowLen)]
-                                    counterCrop = counterCrop + 1
-
-                            # Saving only the windows that have hemorrhage
-                            for i in range(noMoves * noMoves):
-                                if sum(sum(x_segment[:, :, i])) > 0:
-                                    x_original[-1, -1, i] = 255  # having a pixel of 255 so the array will not rescaled to 0-255 bym imsave
-                                    imsave(Path(crossvalid_dir,'CV' +str(cvI),'validate','image',str(counterI) + '.png'),
-                                                      x_original[:, :, i])
-                                    imsave(Path(crossvalid_dir,'CV' +str(cvI),'validate','label',str(counterI) + '.png'),
-                                                      x_segment[:, :, i])
-                                    counterI = counterI + 1
-                        else:
-                            print("Error: Segmentation image was not found.")
-
-            # Testing CT scans
-            for subItest in range(0, len(subjectNos_cvI_testing)):
-                sliceNos = hemorrhage_diagnosis_array[hemorrhage_diagnosis_array[:, 0] == subjectNos_cvI_testing[subItest], 1]
-                datasetDirSubj = Path(datasetDir,
-                        'Patients_CT', "{0:0=3d}".format(subjectNos_cvI_testing[subItest]+49))
-
+                # Validation CT scans
                 counterI = 0
-                for sliceI in range(0, sliceNos.size):
-                    x_original = np.zeros([windowLen, windowLen, noMoves * noMoves],dtype=np.uint8)
-                    x_segment = np.zeros([windowLen, windowLen, noMoves * noMoves],dtype=np.uint8)
+                for subIvalidate in range(0, int(numSubj / NumCV)):  # take only the first fold for validation
+                    sliceNums = hemorrhage_diagnosis_array[hemorrhage_diagnosis_array[:, 0] == subjectNums_cvI_trainVal[subIvalidate], 1]
+                    
+                    # Loading the CT scans and the masks
+                    ct_scan, masks= load_ct_mask(datasetDir, subjectNums_cvI_trainVal[subIvalidate]+49, window_specs)
 
-                    img_path = Path(datasetDirSubj,'brain', str(sliceNos[sliceI]) + '.jpg')
-                    img = imread(img_path)
-                    ##img = imresize(img,new_size)
-                    x = img[5:-5, 5:-5]  # clipping the image to size 640 (new_size)
-                    imsave(Path(crossvalid_dir,'CV' + str(cvI),'test','fullCT','image', str(subjectNos_cvI_testing[subItest])
-                                      + '_' + str(counterI) + '.png'),x)
-                    counterCrop = 0
-                    for i in range(noMoves):
-                        for j in range(noMoves):
-                            x_original[:, :, counterCrop] = x[int(i*imageLen/(noMoves+1)):int(i*imageLen/(noMoves+1)+windowLen),
-                                                                int(j*imageLen/(noMoves+1)):int(j*imageLen/(noMoves+1)+windowLen)]
+                    NoHemorrhage=hemorrhage_diagnosis_array[hemorrhage_diagnosis_array[:, 0] == subjectNums_cvI_trainVal[subIvalidate], 7]
+                    SlicesWithoutHemm = np.nonzero(NoHemorrhage)
+                    for sliceI in range(0,sliceNums.size):
+                        if NoHemorrhage[sliceI] == 0: # Saving only the windows that have hemorrhage
+                            #segmenting the ct scan and the masks
+                            x_ct_segmented = segment_ct(ct_scan[:, :, sliceI], imageLen, windowLen, n_moves)
+                            x_mask_segment = segment_ct(masks[:, :, sliceI], imageLen, windowLen, n_moves)
+
+                            #Saving only the windows that have hemorrhage
+                            for i in range(n_moves*n_moves):
+                                if sum(sum(x_mask_segment[:, :, i]))>0:
+                                    imsave(Path(crossvalid_dir,'CV' +str(cvI),'validate','image',str(counterI) + '.png'), np.uint8(x_ct_segmented[:,:,i]))
+                                    imsave(Path(crossvalid_dir,'CV' +str(cvI),'validate','label',str(counterI) + '.png'), np.uint8(x_mask_segment[:, :,i]))
+                                    counterI = counterI + 1
+
+                # Testing CT scans
+                for subItest in range(0, len(subjectNums_cvI_testing)):
+                    sliceNums = hemorrhage_diagnosis_array[
+                        hemorrhage_diagnosis_array[:, 0] == subjectNums_cvI_testing[subItest], 1]
+
+                    # Loading the CT scans and the masks
+                    ct_scan, masks = load_ct_mask(datasetDir, subjectNums_cvI_testing[subItest] + 49, window_specs)
+                    counterI = 0
+                    for sliceI in range(0, sliceNums.size):
+                        # segmenting the ct scan and the masks
+                        x_ct_segmented = segment_ct(ct_scan[:, :, sliceI], imageLen, windowLen, n_moves)
+                        x_mask_segment = segment_ct(masks[:, :, sliceI], imageLen, windowLen, n_moves)
+
+                        imsave(Path(crossvalid_dir,'CV' + str(cvI),'test','fullCT','image', str(subjectNums_cvI_testing[subItest])
+                                          + '_' + str(counterI) + '.png'),np.uint8(ct_scan[:, :, sliceI]))
+                        imsave(Path(crossvalid_dir,'CV' + str(cvI),'test','fullCT','label', str(subjectNums_cvI_testing[subItest])
+                                          + '_' + str(counterI) + '.png'),np.uint8(masks[:, :, sliceI]))
+
+                        counterCrop = 0
+                        for i in range(n_moves * n_moves):
+                            imsave(Path(crossvalid_dir, 'CV' + str(cvI), 'test','crops', 'image',
+                                        str(subjectNums_cvI_testing[subItest])+ '_' + str(counterI) + '_' +
+                                        str(counterCrop) + '.png'), np.uint8(x_ct_segmented[:, :, i]))
+                            imsave(Path(crossvalid_dir, 'CV' + str(cvI), 'test','crops', 'label',
+                                        str(subjectNums_cvI_testing[subItest])+ '_' + str(counterI) + '_' +
+                                        str(counterCrop) + '.png'), np.uint8(x_mask_segment[:, :, i]))
                             counterCrop = counterCrop + 1
 
-                    # Reading the segmentation for a given slice
-                    segment_path = Path(datasetDirSubj,'brain', str(sliceNos[sliceI]) + '_HGE_Seg.jpg')
-                    if os.path.exists(str(segment_path)):
-                        img = imread(segment_path)
-                        ##img = imresize(img,new_size)
-                        x = np.where(img > 128, 255,
-                                     0)  # Because of the resize the image has some values that are not 0 or 255, so make them 0 or 255
-                        x = x[5:-5, 5:-5]  # clipping the image to size 640 (new_size)
-                        imsave(Path(crossvalid_dir,'CV' + str(cvI),'test','fullCT','label', str(subjectNos_cvI_testing[subItest])
-                                      + '_' + str(counterI) + '.png'), x)
-                        counterCrop = 0
-                        for i in range(noMoves):
-                            for j in range(noMoves):
-                                x_segment[:, :, counterCrop] = x[int(i*imageLen/(noMoves+1)):int(i*imageLen/(noMoves+1)+windowLen),
-                                                                int(j*imageLen/(noMoves+1)):int(j*imageLen/(noMoves+1)+windowLen)]
-                                x_original[-1, -1, counterCrop] = 255  # having a pixel of 255 so the array will not rescaled to 0-255 bym imsave
-                                imsave(Path(crossvalid_dir,'CV' + str(cvI),'test','crops','image',  str(subjectNos_cvI_testing[subItest])
-                                      + '_' + str(counterI) +'_'+ str(counterCrop)+ '.png'),
-                                                  x_original[:, :, counterCrop])
-                                imsave(Path(crossvalid_dir,'CV' + str(cvI),'test','crops','label',  str(subjectNos_cvI_testing[subItest])
-                                      + '_' + str(counterI) +'_'+ str(counterCrop)+  '.png'),
-                                                  x_segment[:, :, counterCrop])
-                                counterCrop = counterCrop + 1
-                    else:  # no hemorrhage then save black images
-                        imsave(Path(crossvalid_dir,'CV' + str(cvI),'test','fullCT','label',str(subjectNos_cvI_testing[subItest])
-                                      + '_' + str(counterI) + '.png'), np.zeros([imageLen, imageLen],dtype=np.uint8))
-                        counterCrop = 0
-                        for i in range(noMoves * noMoves):
-                            x_original[-1, -1,counterCrop] = 255 #having a pixel of 255 so the array will not rescaled to 0-255 bym imsave
-                            imsave(Path(crossvalid_dir,'CV' + str(cvI),'test','crops','image', str(subjectNos_cvI_testing[subItest])
-                                      + '_' + str(counterI) +'_'+ str(counterCrop)+ '.png'),
-                                              x_original[:, :, counterCrop])
-                            imsave(Path(crossvalid_dir,'CV' + str(cvI),'test','crops','label', str(subjectNos_cvI_testing[subItest])
-                                      + '_' + str(counterI) +'_'+ str(counterCrop)+  '.png'),
-                                              np.zeros([windowLen, windowLen],dtype=np.uint8))
-                            counterCrop = counterCrop + 1
-                    counterI = counterI + 1
+                        counterI = counterI + 1
 
-        ############################################Saving the CT slices to ndarrays#####################################
+            ############################################Saving the CT slices to ndarrays#####################################
 
-        AllCTscans = np.zeros([hemorrhage_diagnosis_array.shape[0], imageLen, imageLen], dtype=np.uint8)
-        Allsegment = np.zeros([hemorrhage_diagnosis_array.shape[0], imageLen, imageLen], dtype=np.uint8)
-        counterI=0
-        for sNo in range(0,numSubj):
-            sliceNos=hemorrhage_diagnosis_array[hemorrhage_diagnosis_array[:,0]==sNo,1]
-            datasetDirSubj = Path(datasetDir,
-                        'Patients_CT',"{0:0=3d}".format(sNo+49))
-            for sliceI in range(0,sliceNos.size):
-                img_path=Path(datasetDirSubj,'brain',str(sliceNos[sliceI]) + '.jpg')
-                img = imread(img_path)
-                ##img = imresize(img,new_size)
-                x = img[5:-5, 5:-5]  # clipping the image to size 640 (new_size)
-                AllCTscans[counterI] = x
+            AllCTscans = np.zeros([hemorrhage_diagnosis_array.shape[0], imageLen, imageLen], dtype=np.uint8)
+            Allsegment = np.zeros([hemorrhage_diagnosis_array.shape[0], imageLen, imageLen], dtype=np.uint8)
+            counterI=0
 
-                #Saving the segmentation for a given slice
-                segment_path = Path(datasetDirSubj,'brain',str(sliceNos[sliceI]) + '_HGE_Seg.jpg')
-                if os.path.exists(str(segment_path)):
-                    img = imread(segment_path)
-                    ##img = imresize(img,new_size)
-                    x = np.where(img > 128, 255,
-                                 0)  # Because of the resize the image has some values that are not 0 or 255, so make them 0 or 255
-                    x = x[5:-5, 5:-5]  # clipping the image to size 640 (new_size)
-                    Allsegment[counterI] = x
-                else:
-                    x=np.zeros([imageLen,imageLen],dtype=np.uint8)
-                    Allsegment[counterI] = x
+            for s_num in subject_nums:
+                sliceNums=hemorrhage_diagnosis_array[hemorrhage_diagnosis_array[:,0]==s_num,1]
 
-                counterI=counterI+1
+                # Loading the CT scans and the masks
+                ct_scan, masks = load_ct_mask(datasetDir, s_num + 49, window_specs)
 
-        with open(str(Path(crossvalid_dir,'ICH_DataSegmentV1.pkl')), 'wb') as Dataset1:  # Python 3: open(..., 'wb')
-                pickle.dump(
-                    [hemorrhage_diagnosis_array, AllCTscans, Allsegment, sNos], Dataset1)
+                for sliceI in range(0,sliceNums.size):
+                    AllCTscans[counterI] = ct_scan[:,:,sliceI]
+                    Allsegment[counterI] = masks[:,:,sliceI]
+                    counterI=counterI+1
+
+            with open(str(Path(crossvalid_dir,'ICH_DataSegmentV1.pkl')), 'wb') as Dataset1:  # Python 3: open(..., 'wb')
+                    pickle.dump(
+                        [hemorrhage_diagnosis_array, AllCTscans, Allsegment, subject_nums_shaffled], Dataset1)
+
+        else:
+            print("Zipped dataset is not in the current directory. "
+                  "Download the dataset from https://physionet.org/content/ct-ich/1.3.1/ then move it to same directory with main.py")
     else:
         print("The dataset is already downloaded and the cross-validation folds were created!")
